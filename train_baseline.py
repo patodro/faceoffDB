@@ -19,6 +19,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 
+# Dataset labels and the corresponding folders used for curated clips.
 LABELS = ("CLEAN", "DISMISSAL", "RESET")
 REFERENCE_DIRS = {
     "CLEAN": "clean_examples",
@@ -31,6 +32,7 @@ SPATIAL_GRID = 2
 DIRECTION_BINS = 8
 
 
+# Keep each annotation together with the resolved clip path used by training.
 @dataclass(frozen=True)
 class ClipRecord:
     game_id: str
@@ -41,6 +43,7 @@ class ClipRecord:
 
 
 def parse_args() -> argparse.Namespace:
+    """Configure paths and video sampling settings from command-line options."""
     project_root = Path(__file__).resolve().parent
     default_annotations = project_root.parent / "OneDrive" / "annotations.csv"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -57,6 +60,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _clip_name(filename: str) -> str:
+    """Allow annotation filenames with or without their media extension."""
     path = Path(filename)
     return filename if path.suffix else f"{filename}.mp4"
 
@@ -64,6 +68,7 @@ def _clip_name(filename: str) -> str:
 def load_records(
     annotations_path: Path, clips_root: Path, reference_root: Path
 ) -> list[ClipRecord]:
+    """Validate annotations and prefer trimmed reference clips over raw clips."""
     if not annotations_path.is_file():
         raise FileNotFoundError(f"Annotation CSV not found: {annotations_path}")
 
@@ -101,6 +106,7 @@ def load_records(
                 )
             seen.add(key)
 
+            # Use the curated version whenever available; raw footage is fallback.
             clip_name = _clip_name(filename)
             raw_path = clips_root / game_id / clip_name
             reference_paths = [
@@ -152,6 +158,7 @@ def load_records(
 def sample_video_frames(
     video_path: Path, frame_count: int, width: int, height: int
 ) -> list[np.ndarray]:
+    """Sample evenly spaced, resized grayscale frames from one video."""
     if frame_count < 2:
         raise ValueError("--frames must be at least 2.")
     if width < 1 or height < 1:
@@ -191,11 +198,13 @@ def sample_video_frames(
 
 
 def extract_flow_features(frames: Sequence[np.ndarray]) -> np.ndarray:
+    """Summarize motion direction and magnitude across time and image regions."""
     if len(frames) < 2:
         raise ValueError("At least two frames are needed to calculate optical flow.")
 
     features: list[float] = []
     flow_count = len(frames) - 1
+    # Divide motion into temporal chunks so rough event timing is retained.
     for temporal_bin in range(TEMPORAL_BINS):
         start = math.floor(temporal_bin * flow_count / TEMPORAL_BINS)
         end = math.floor((temporal_bin + 1) * flow_count / TEMPORAL_BINS)
@@ -215,6 +224,7 @@ def extract_flow_features(frames: Sequence[np.ndarray]) -> np.ndarray:
         all_magnitudes: list[np.ndarray] = []
 
         for flow_index in range(start, end):
+            # Dense optical flow estimates each pixel's movement between frames.
             flow = cv2.calcOpticalFlowFarneback(
                 frames[flow_index],
                 frames[flow_index + 1],
@@ -261,6 +271,7 @@ def extract_flow_features(frames: Sequence[np.ndarray]) -> np.ndarray:
             for column in range(SPATIAL_GRID):
                 histogram = direction_histograms[row, column]
                 total = histogram.sum()
+                # Normalize direction counts so feature size is less tied to motion volume.
                 if total > 0:
                     histogram = histogram / total
                 features.extend(histogram.tolist())
@@ -289,6 +300,7 @@ def extract_flow_features(frames: Sequence[np.ndarray]) -> np.ndarray:
 def features_for_records(
     records: Sequence[ClipRecord], frame_count: int, width: int, height: int
 ) -> tuple[list[ClipRecord], np.ndarray, list[tuple[ClipRecord, str]]]:
+    """Extract features, keeping unreadable clips in a separate error report."""
     readable_records: list[ClipRecord] = []
     all_features = []
     unreadable_records: list[tuple[ClipRecord, str]] = []
@@ -310,6 +322,7 @@ def features_for_records(
 
 
 def make_classifier() -> SVC:
+    """Build a scaled SVM that compensates for the dataset's class imbalance."""
     return make_pipeline(
         StandardScaler(),
         SVC(kernel="rbf", class_weight="balanced", random_state=42),
@@ -317,6 +330,7 @@ def make_classifier() -> SVC:
 
 
 def evaluate(records: Sequence[ClipRecord], features: np.ndarray) -> np.ndarray:
+    """Measure generalization by holding out each complete game in turn."""
     groups = np.asarray([record.game_id for record in records])
     labels = np.asarray([record.label for record in records])
     unique_games = np.unique(groups)
@@ -326,6 +340,7 @@ def evaluate(records: Sequence[ClipRecord], features: np.ndarray) -> np.ndarray:
     predictions = np.empty(labels.shape, dtype=object)
     splitter = GroupKFold(n_splits=len(unique_games))
     for train_indexes, test_indexes in splitter.split(features, labels, groups):
+        # Ensure every class is available for training without leaking held-out games.
         train_labels = set(labels[train_indexes])
         missing = set(LABELS) - train_labels
         if missing:
@@ -352,6 +367,7 @@ def evaluate(records: Sequence[ClipRecord], features: np.ndarray) -> np.ndarray:
 def write_predictions(
     path: Path, records: Sequence[ClipRecord], predictions: Sequence[str]
 ) -> None:
+    """Save each cross-validation prediction beside its annotation metadata."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)
@@ -379,6 +395,7 @@ def write_predictions(
 def write_unreadable_clips(
     path: Path, unreadable_records: Sequence[tuple[ClipRecord, str]]
 ) -> None:
+    """Save videos that could not be decoded instead of silently dropping them."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)
@@ -398,6 +415,7 @@ def write_unreadable_clips(
 
 
 def main() -> None:
+    """Run data loading, feature extraction, evaluation, training, and exports."""
     args = parse_args()
     records = load_records(args.annotations, args.clips_root, args.reference_root)
     readable_records, features, unreadable_records = features_for_records(
@@ -414,6 +432,7 @@ def main() -> None:
     )
     predictions = evaluate(readable_records, features)
 
+    # Train the deployable model on all readable clips after held-out evaluation.
     final_classifier = make_classifier()
     final_classifier.fit(
         features, np.asarray([record.label for record in readable_records])
